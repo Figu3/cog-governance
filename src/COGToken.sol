@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
@@ -29,6 +29,7 @@ contract COGToken is ERC20, ERC20Burnable, Ownable, ICOGToken {
     error NotDelegated();
     error OnlyTreasury();
     error TreasuryAlreadySet();
+    error ZeroAddress();
 
     modifier onlyTreasury() {
         if (msg.sender != treasury) revert OnlyTreasury();
@@ -41,6 +42,7 @@ contract COGToken is ERC20, ERC20Burnable, Ownable, ICOGToken {
     /// @param treasury_ The treasury contract address
     function setTreasury(address treasury_) external onlyOwner {
         if (treasury != address(0)) revert TreasuryAlreadySet();
+        if (treasury_ == address(0)) revert ZeroAddress();
         treasury = treasury_;
     }
 

@@ -289,6 +289,12 @@ contract COGTokenTest is Test {
         vm.assume(delegator != address(0) && delegatee != address(0));
         vm.assume(delegator != delegatee);
         vm.assume(delegator != address(this));
+        // Exclude setup addresses to avoid interference with existing balances/delegations
+        vm.assume(delegator != alice && delegator != bob && delegator != charlie && delegator != treasury);
+        vm.assume(delegatee != alice && delegatee != bob && delegatee != charlie && delegatee != treasury);
+
+        // Record delegatee's power before delegation
+        uint256 powerBefore = token.delegatedPower(delegatee);
 
         token.mint(delegator, 100e18);
 
@@ -296,7 +302,8 @@ contract COGTokenTest is Test {
         token.delegate(delegatee);
 
         assertEq(token.delegates(delegator), delegatee);
-        assertEq(token.delegatedPower(delegatee), 100e18);
+        // Check that delegated power INCREASED by 100e18 (not equals 100e18)
+        assertEq(token.delegatedPower(delegatee), powerBefore + 100e18);
     }
 
     function testFuzz_Transfer_UpdatesDelegatedPower(uint256 amount) public {

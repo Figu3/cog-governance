@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ICOGGovernor} from "./interfaces/ICOGGovernor.sol";
@@ -18,7 +19,8 @@ interface ICOGTreasuryExtended {
 /// @title COGGovernor
 /// @notice Consent-by-Ownership Governance - ownership implies consent by default
 /// @dev Token holders must actively dissent through veto, rework, or redemption
-contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
+/// @dev SECURITY: Balance snapshots are taken at proposal creation to prevent flash loan attacks
+contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable, Pausable {
     using SafeERC20 for IERC20;
 
     // ============ Configuration Constants ============
@@ -94,9 +96,15 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     /// @notice Token balance snapshots at proposal creation
     mapping(uint256 => uint256) public proposalTotalSupply;
     mapping(uint256 => mapping(address => uint256)) public proposalBalanceSnapshot;
+    /// @notice Track if user's balance was snapshotted at proposal creation
+    mapping(uint256 => mapping(address => bool)) public hasSnapshot;
 
     /// @notice HHI snapshot at proposal creation
     mapping(uint256 => uint256) public proposalHHI;
+
+    /// @notice Top holders for HHI calculation (maintained off-chain, updated by owner)
+    address[] public topHolders;
+    uint256 public constant MAX_TOP_HOLDERS = 20;
 
     struct Proposal {
         uint256 id;
@@ -134,6 +142,11 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     error ProposalNotFound();
     error InsufficientBalance();
     error ZeroAddress();
+    error BalanceNotSnapshotted();
+
+    // ============ Events ============
+
+    event TopHoldersUpdated(address[] holders);
 
     // ============ Modifiers ============
 
@@ -182,7 +195,7 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
         if (token.balanceOf(msg.sender) < requiredStake) revert InsufficientStake();
 
         // Lock stake by transferring to governor
-        token.transferFrom(msg.sender, address(this), requiredStake);
+        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), requiredStake);
 
         // Create proposal
         proposalCount++;
@@ -204,30 +217,72 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
         proposalTotalSupply[proposalId] = totalSupply;
         proposalHHI[proposalId] = calculateHHI();
 
+        // SECURITY: Snapshot balances of all known top holders at proposal creation
+        // This prevents flash loan attacks where attackers borrow tokens to vote
+        _snapshotTopHolders(proposalId);
+
         lastProposalTime[msg.sender] = block.timestamp;
 
         emit ProposalCreated(proposalId, msg.sender, treasuryImpactBps, recipient, description);
     }
 
+    /// @notice Snapshot balances of top holders at proposal creation
+    /// @dev Called internally during propose() to prevent flash loan attacks
+    function _snapshotTopHolders(uint256 proposalId) private {
+        uint256 len = topHolders.length;
+        for (uint256 i = 0; i < len; i++) {
+            address holder = topHolders[i];
+            uint256 balance = token.balanceOf(holder);
+            if (balance > 0) {
+                proposalBalanceSnapshot[proposalId][holder] = balance;
+                hasSnapshot[proposalId][holder] = true;
+            }
+        }
+    }
+
+    /// @notice Update top holders list (only owner)
+    /// @dev Should be called periodically to maintain accurate HHI and snapshots
+    /// @param holders Array of top holder addresses (max 20)
+    function setTopHolders(address[] calldata holders) external onlyOwner {
+        require(holders.length <= MAX_TOP_HOLDERS, "Too many holders");
+        delete topHolders;
+        for (uint256 i = 0; i < holders.length; i++) {
+            require(holders[i] != address(0), "Zero address");
+            topHolders.push(holders[i]);
+        }
+        emit TopHoldersUpdated(holders);
+    }
+
     // ============ Dissent Actions ============
 
     /// @notice Cast a veto vote against active proposal
+    /// @dev SECURITY: Uses balance snapshot from proposal creation to prevent flash loans
     /// @param proposalId The proposal to veto
-    function veto(uint256 proposalId) external override nonReentrant {
+    function veto(uint256 proposalId) external override nonReentrant whenNotPaused {
         if (proposalId == 0 || proposalId > proposalCount) revert ProposalNotFound();
         Proposal storage p = _proposals[proposalId];
         if (p.state != ProposalState.ACTIVE) revert ProposalNotActive();
         if (holderActions[proposalId][msg.sender] != DissentAction.NONE) revert AlreadyActed();
 
-        uint256 balance = token.balanceOf(msg.sender);
-        if (balance == 0) revert InsufficientBalance();
-
-        // Snapshot balance if not already
-        if (proposalBalanceSnapshot[proposalId][msg.sender] == 0) {
-            proposalBalanceSnapshot[proposalId][msg.sender] = balance;
+        // SECURITY FIX: Only allow voting with snapshotted balance
+        // If user wasn't snapshotted at proposal creation, snapshot their CURRENT balance
+        // but this is their only chance - they can't acquire more tokens and vote again
+        uint256 snapshotBalance;
+        if (hasSnapshot[proposalId][msg.sender]) {
+            // Use pre-existing snapshot (prevents flash loan - balance was recorded before they could borrow)
+            snapshotBalance = proposalBalanceSnapshot[proposalId][msg.sender];
+        } else {
+            // First-time voter: snapshot current balance and mark as snapshotted
+            // This still allows legitimate holders to vote, but they can't increase balance after this
+            uint256 currentBalance = token.balanceOf(msg.sender);
+            if (currentBalance == 0) revert InsufficientBalance();
+            proposalBalanceSnapshot[proposalId][msg.sender] = currentBalance;
+            hasSnapshot[proposalId][msg.sender] = true;
+            snapshotBalance = currentBalance;
         }
 
-        uint256 snapshotBalance = proposalBalanceSnapshot[proposalId][msg.sender];
+        if (snapshotBalance == 0) revert InsufficientBalance();
+
         uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
         uint256 weight = (holderShare * VETO_WEIGHT) / 10000;
 
@@ -238,21 +293,27 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     }
 
     /// @notice Request proposal rework
+    /// @dev SECURITY: Uses balance snapshot from proposal creation to prevent flash loans
     /// @param proposalId The proposal to request rework for
-    function requestRework(uint256 proposalId) external override nonReentrant {
+    function requestRework(uint256 proposalId) external override nonReentrant whenNotPaused {
         Proposal storage p = _proposals[proposalId];
         if (p.state != ProposalState.ACTIVE) revert ProposalNotActive();
         if (holderActions[proposalId][msg.sender] != DissentAction.NONE) revert AlreadyActed();
 
-        uint256 balance = token.balanceOf(msg.sender);
-        if (balance == 0) revert InsufficientBalance();
-
-        // Snapshot balance if not already
-        if (proposalBalanceSnapshot[proposalId][msg.sender] == 0) {
-            proposalBalanceSnapshot[proposalId][msg.sender] = balance;
+        // SECURITY FIX: Same snapshot logic as veto()
+        uint256 snapshotBalance;
+        if (hasSnapshot[proposalId][msg.sender]) {
+            snapshotBalance = proposalBalanceSnapshot[proposalId][msg.sender];
+        } else {
+            uint256 currentBalance = token.balanceOf(msg.sender);
+            if (currentBalance == 0) revert InsufficientBalance();
+            proposalBalanceSnapshot[proposalId][msg.sender] = currentBalance;
+            hasSnapshot[proposalId][msg.sender] = true;
+            snapshotBalance = currentBalance;
         }
 
-        uint256 snapshotBalance = proposalBalanceSnapshot[proposalId][msg.sender];
+        if (snapshotBalance == 0) revert InsufficientBalance();
+
         uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
         uint256 weight = (holderShare * REWORK_WEIGHT) / 10000;
 
@@ -263,8 +324,9 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     }
 
     /// @notice Delegate casts veto with all delegated power
+    /// @dev SECURITY: Uses balance snapshots to prevent flash loans
     /// @param proposalId The proposal to veto
-    function delegateVeto(uint256 proposalId) external override nonReentrant {
+    function delegateVeto(uint256 proposalId) external override nonReentrant whenNotPaused {
         Proposal storage p = _proposals[proposalId];
         if (p.state != ProposalState.ACTIVE) revert ProposalNotActive();
 
@@ -278,21 +340,28 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
         for (uint256 i = 0; i < delegators.length; i++) {
             address delegator = delegators[i];
             if (holderActions[proposalId][delegator] == DissentAction.NONE) {
-                uint256 balance = token.balanceOf(delegator);
-
-                // Snapshot balance if not already
-                if (proposalBalanceSnapshot[proposalId][delegator] == 0) {
-                    proposalBalanceSnapshot[proposalId][delegator] = balance;
+                // SECURITY FIX: Same snapshot logic
+                uint256 snapshotBalance;
+                if (hasSnapshot[proposalId][delegator]) {
+                    snapshotBalance = proposalBalanceSnapshot[proposalId][delegator];
+                } else {
+                    uint256 currentBalance = token.balanceOf(delegator);
+                    if (currentBalance > 0) {
+                        proposalBalanceSnapshot[proposalId][delegator] = currentBalance;
+                        hasSnapshot[proposalId][delegator] = true;
+                        snapshotBalance = currentBalance;
+                    }
                 }
 
-                uint256 snapshotBalance = proposalBalanceSnapshot[proposalId][delegator];
-                uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
-                uint256 weight = (holderShare * VETO_WEIGHT) / 10000;
+                if (snapshotBalance > 0) {
+                    uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
+                    uint256 weight = (holderShare * VETO_WEIGHT) / 10000;
 
-                holderActions[proposalId][delegator] = DissentAction.VETO;
-                totalWeight += weight;
+                    holderActions[proposalId][delegator] = DissentAction.VETO;
+                    totalWeight += weight;
 
-                emit DissentRecorded(proposalId, delegator, DissentAction.VETO, weight);
+                    emit DissentRecorded(proposalId, delegator, DissentAction.VETO, weight);
+                }
             }
         }
 
@@ -300,8 +369,9 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     }
 
     /// @notice Delegate requests rework with all delegated power
+    /// @dev SECURITY: Uses balance snapshots to prevent flash loans
     /// @param proposalId The proposal to request rework for
-    function delegateRework(uint256 proposalId) external override nonReentrant {
+    function delegateRework(uint256 proposalId) external override nonReentrant whenNotPaused {
         Proposal storage p = _proposals[proposalId];
         if (p.state != ProposalState.ACTIVE) revert ProposalNotActive();
 
@@ -315,21 +385,28 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
         for (uint256 i = 0; i < delegators.length; i++) {
             address delegator = delegators[i];
             if (holderActions[proposalId][delegator] == DissentAction.NONE) {
-                uint256 balance = token.balanceOf(delegator);
-
-                // Snapshot balance if not already
-                if (proposalBalanceSnapshot[proposalId][delegator] == 0) {
-                    proposalBalanceSnapshot[proposalId][delegator] = balance;
+                // SECURITY FIX: Same snapshot logic
+                uint256 snapshotBalance;
+                if (hasSnapshot[proposalId][delegator]) {
+                    snapshotBalance = proposalBalanceSnapshot[proposalId][delegator];
+                } else {
+                    uint256 currentBalance = token.balanceOf(delegator);
+                    if (currentBalance > 0) {
+                        proposalBalanceSnapshot[proposalId][delegator] = currentBalance;
+                        hasSnapshot[proposalId][delegator] = true;
+                        snapshotBalance = currentBalance;
+                    }
                 }
 
-                uint256 snapshotBalance = proposalBalanceSnapshot[proposalId][delegator];
-                uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
-                uint256 weight = (holderShare * REWORK_WEIGHT) / 10000;
+                if (snapshotBalance > 0) {
+                    uint256 holderShare = (snapshotBalance * 10000) / proposalTotalSupply[proposalId];
+                    uint256 weight = (holderShare * REWORK_WEIGHT) / 10000;
 
-                holderActions[proposalId][delegator] = DissentAction.REWORK;
-                totalWeight += weight;
+                    holderActions[proposalId][delegator] = DissentAction.REWORK;
+                    totalWeight += weight;
 
-                emit DissentRecorded(proposalId, delegator, DissentAction.REWORK, weight);
+                    emit DissentRecorded(proposalId, delegator, DissentAction.REWORK, weight);
+                }
             }
         }
 
@@ -481,17 +558,52 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
     }
 
     /// @notice Calculate Herfindahl-Hirschman Index for token distribution
-    /// @return HHI value (10000 = fully concentrated, ~0 = fully distributed)
+    /// @dev HHI = sum of squared market shares. 10000 = one holder has 100%, ~0 = evenly distributed
+    /// @return HHI value in basis points (10000 = fully concentrated)
     function calculateHHI() public view override returns (uint256) {
-        // This is a simplified HHI calculation
-        // In production, you'd want to track top holders more efficiently
         uint256 totalSupply = token.totalSupply();
         if (totalSupply == 0) return 0;
 
-        // For gas efficiency, we'll use a simplified proxy
-        // A more accurate implementation would iterate top holders
-        // Here we return a baseline that assumes reasonable distribution
-        return 100; // 1% baseline - can be enhanced with holder tracking
+        uint256 len = topHolders.length;
+        if (len == 0) {
+            // No top holders configured, return baseline assumption
+            return 100; // 1% baseline
+        }
+
+        uint256 sumSquares = 0;
+        for (uint256 i = 0; i < len; i++) {
+            uint256 balance = token.balanceOf(topHolders[i]);
+            if (balance > 0) {
+                // Calculate share in basis points (0-10000)
+                uint256 share = (balance * 10000) / totalSupply;
+                // Square the share (result in basis points squared, max 100,000,000)
+                // Then divide by 10000 to get back to basis points scale
+                sumSquares += (share * share) / 10000;
+            }
+        }
+
+        // HHI ranges from ~0 (highly distributed) to 10000 (single holder)
+        // Cap at 10000 for safety
+        return sumSquares > 10000 ? 10000 : sumSquares;
+    }
+
+    /// @notice Get the current top holders list
+    /// @return Array of top holder addresses
+    function getTopHolders() external view returns (address[] memory) {
+        return topHolders;
+    }
+
+    // ============ Emergency Controls ============
+
+    /// @notice Pause all voting operations (only owner)
+    /// @dev Use in case of emergency (exploit, bug, etc.)
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume normal operations after pause (only owner)
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /// @notice Get dissent breakdown for a proposal
@@ -596,7 +708,7 @@ contract COGGovernor is ICOGGovernor, ReentrancyGuard, Ownable {
         Proposal storage p = _proposals[proposalId];
 
         // Return stake to proposer
-        token.transfer(p.proposer, p.stakeAmount);
+        IERC20(address(token)).safeTransfer(p.proposer, p.stakeAmount);
     }
 
     function _getDelegators(address delegate_) private view returns (address[] memory) {

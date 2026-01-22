@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICOGTreasury} from "./interfaces/ICOGTreasury.sol";
 import {ICOGToken} from "./interfaces/ICOGToken.sol";
 import {ICOGGovernor} from "./interfaces/ICOGGovernor.sol";
@@ -12,7 +13,7 @@ import {ICOGGovernor} from "./interfaces/ICOGGovernor.sol";
 /// @title COGTreasury
 /// @notice 100% stablecoin treasury with NAV-based redemption
 /// @dev Redemptions include haircut only during active proposals
-contract COGTreasury is ICOGTreasury, ReentrancyGuard, Ownable {
+contract COGTreasury is ICOGTreasury, ReentrancyGuard, Ownable, Pausable {
     using SafeERC20 for IERC20;
 
     /// @notice The stablecoin held in treasury (USDC or similar)
@@ -134,7 +135,20 @@ contract COGTreasury is ICOGTreasury, ReentrancyGuard, Ownable {
         stablecoinToken.safeTransfer(to, fees);
     }
 
-    function _executeRedemption(address holder, uint256 tokenAmount, bool isFullRedeem) private {
+    // ============ Emergency Controls ============
+
+    /// @notice Pause all redemptions (only owner)
+    /// @dev Use in case of emergency (exploit, bug, etc.)
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume normal operations after pause (only owner)
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function _executeRedemption(address holder, uint256 tokenAmount, bool isFullRedeem) private whenNotPaused {
         uint256 navValue = nav();
 
         // Apply haircut only during active proposals
